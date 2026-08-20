@@ -67,6 +67,8 @@ func (d *Daemon) Start() error {
 
 	d.manager.exportUsers()
 
+	go startVerifiedSessionCleaner()
+
 	d.loginedManager, err = logined.Register(logger, service)
 	if err != nil {
 		logger.Error("Failed to create logined manager:", err)

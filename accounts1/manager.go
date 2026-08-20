@@ -62,6 +62,8 @@ const (
 	dsettingsAppID                 = "org.deepin.dde.daemon"
 	dsettingsAccountName           = "org.deepin.dde.daemon.account"
 	dsettingsIsTerminalLocked      = "isTerminalLocked"
+	dsettingsSqMaxRetries          = "sqMaxRetries"
+	dsettingsSqLockSecs            = "sqLockSecs"
 	gsSchemaDdeControlCenter       = "com.deepin.dde.control-center"
 	settingKeyAutoLoginVisable     = "auto-login-visable"
 	keyPasswordEncryptionAlgorithm = "passwordEncryptionAlgorithm"
@@ -680,6 +682,28 @@ func (m *Manager) getDConfigPasswdEncryptionAlgorithm() (string, error) {
 	return alg, nil
 }
 
+// dconfigInt 读取 dconfig 中的整型配置，统一处理 float64/int64 类型转换，
+// 读取失败或类型非法时返回默认值并记录警告。
+func (m *Manager) dconfigInt(key string, def int) int {
+	if m.dsAccount == nil {
+		return def
+	}
+	v, err := m.dsAccount.Value(0, key)
+	if err != nil {
+		logger.Warningf("[dconfigInt] read %s failed: %v", key, err)
+		return def
+	}
+	switch vv := v.Value().(type) {
+	case float64:
+		return int(int64(vv))
+	case int64:
+		return int(vv)
+	default:
+		logger.Warningf("[dconfigInt] %s type is wrong: %T", key, v.Value())
+		return def
+	}
+}
+
 func (m *Manager) initAccountDSettings() {
 	m.cfgManager = configManager.NewConfigManager(m.sysSigLoop.Conn())
 
@@ -704,6 +728,13 @@ func (m *Manager) initAccountDSettings() {
 	if data, ok := v.Value().(bool); ok {
 		m.IsTerminalLocked = data
 	}
+
+	// 读取安全问题限制配置
+	sqMaxRetries := m.dconfigInt(dsettingsSqMaxRetries, sqDefaultMaxRetries)
+	sqLockSecs := m.dconfigInt(dsettingsSqLockSecs, sqDefaultLockSecs)
+	SetSqLimitParams(sqMaxRetries, sqLockSecs)
+	logger.Infof("DConfig sqMaxRetries=%d sqLockSecs=%d", sqMaxRetries, sqLockSecs)
+
 	users.PasswdAlgoDefault, _ = m.getDConfigPasswdEncryptionAlgorithm()
 	m.dsAccount.InitSignalExt(m.sysSigLoop, true)
 	m.dsAccount.ConnectValueChanged(func(key string) {

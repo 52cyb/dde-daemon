@@ -26,6 +26,16 @@
         </defaults>
     </action>
 
+    <action id="org.deepin.dde.accounts.change-security-questions">
+        <description>Change security questions for password reset</description>
+        <message>Authentication is required to change security questions for password reset</message>
+        <defaults>
+            <allow_any>no</allow_any>
+            <allow_inactive>no</allow_inactive>
+            <allow_active>auth_self</allow_active>
+        </defaults>
+    </action>
+
     <action id="org.deepin.dde.accounts.enable-auto-login">
         <description>Enable Auto Login</description>
         <message>Authentication is required to enable auto login</message>

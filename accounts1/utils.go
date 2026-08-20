@@ -28,17 +28,18 @@ import (
 
 // #nosec G101
 const (
-	polkitActionUserAdministration     = "org.deepin.dde.accounts.user-administration"
-	polkitActionChangeOwnData          = "org.deepin.dde.accounts.change-own-user-data"
-	polkitActionEnableAutoLogin        = "org.deepin.dde.accounts.enable-auto-login"
-	polkitActionDisableAutoLogin       = "org.deepin.dde.accounts.disable-auto-login"
-	polkitActionEnableNoPasswordLogin  = "org.deepin.dde.accounts.enable-nopass-login"
-	polkitActionDisableNoPasswordLogin = "org.deepin.dde.accounts.disable-nopass-login"
-	polkitActionEnableWechatAuth       = "org.deepin.dde.accounts.enable-wechat-auth"
-	polkitActionDisableWechatAuth      = "org.deepin.dde.accounts.disable-wechat-auth"
-	polkitActionSetKeyboardLayout      = "org.deepin.dde.accounts.set-keyboard-layout"
-	polkitActionEnableQuickLogin       = "org.deepin.dde.accounts.enable-quick-login"
-	polkitActionDisableQuickLogin      = "org.deepin.dde.accounts.disable-quick-login"
+	polkitActionUserAdministration      = "org.deepin.dde.accounts.user-administration"
+	polkitActionChangeOwnData           = "org.deepin.dde.accounts.change-own-user-data"
+	polkitActionChangeSecurityQuestions = "org.deepin.dde.accounts.change-security-questions"
+	polkitActionEnableAutoLogin         = "org.deepin.dde.accounts.enable-auto-login"
+	polkitActionDisableAutoLogin        = "org.deepin.dde.accounts.disable-auto-login"
+	polkitActionEnableNoPasswordLogin   = "org.deepin.dde.accounts.enable-nopass-login"
+	polkitActionDisableNoPasswordLogin  = "org.deepin.dde.accounts.disable-nopass-login"
+	polkitActionEnableWechatAuth        = "org.deepin.dde.accounts.enable-wechat-auth"
+	polkitActionDisableWechatAuth       = "org.deepin.dde.accounts.disable-wechat-auth"
+	polkitActionSetKeyboardLayout       = "org.deepin.dde.accounts.set-keyboard-layout"
+	polkitActionEnableQuickLogin        = "org.deepin.dde.accounts.enable-quick-login"
+	polkitActionDisableQuickLogin       = "org.deepin.dde.accounts.disable-quick-login"
 
 	systemLocaleFile  = "/etc/default/locale"
 	systemdLocaleFile = "/etc/locale.conf"
@@ -198,8 +199,9 @@ func checkAuthByPolkit(actionId string, sysBusName string) (ret polkit.Authoriza
 	subject := polkit.MakeSubject(polkit.SubjectKindSystemBusName)
 	subject.SetDetail("name", sysBusName)
 
+	detail := getPolkitDetail(actionId)
 	ret, err = authority.CheckAuthorization(0, subject,
-		actionId, nil,
+		actionId, detail,
 		polkit.CheckAuthorizationFlagsAllowUserInteraction, "")
 	if err != nil {
 		logger.Warningf("call check auth failed, err: %v", err)
@@ -207,6 +209,19 @@ func checkAuthByPolkit(actionId string, sysBusName string) (ret polkit.Authoriza
 	}
 	logger.Debugf("call check auth success, ret: %v", ret)
 	return
+}
+
+func getPolkitDetail(actionId string) map[string]string {
+	switch actionId {
+	case polkitActionChangeSecurityQuestions:
+		// 安全问题涉及密码找回入口，强制仅限密码认证
+		return map[string]string{
+			"exAuth":      "true",
+			"exAuthFlags": "1",
+		}
+	default:
+		return nil
+	}
 }
 
 func getDetailsKey(details map[string]dbus.Variant, key string) (interface{}, error) {

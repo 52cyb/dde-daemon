@@ -18,7 +18,9 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +29,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -34,6 +37,7 @@ import (
 	"github.com/linuxdeepin/dde-api/lang_info"
 	"github.com/linuxdeepin/dde-daemon/accounts1/users"
 	"github.com/linuxdeepin/dde-daemon/common/sessionmsg"
+	authenticate "github.com/linuxdeepin/go-dbus-factory/system/org.deepin.dde.authenticate1"
 	"github.com/linuxdeepin/go-lib/dbusutil"
 	"github.com/linuxdeepin/go-lib/gdkpixbuf"
 	"github.com/linuxdeepin/go-lib/imgutil"
@@ -1143,14 +1147,18 @@ func (u *User) GetSecretQuestions() (list []int, err *dbus.Error) {
 		return nil
 	})
 	if err1 != nil {
+		logger.Warningf("[GetSecretQuestions] walk questions failed for user=%s: %v", u.UserName, err1)
 		err = dbusutil.ToError(err1)
 	}
 
 	return
 }
 
-func (u *User) VerifySecretQuestions(answers map[int]string) (failed []int, err *dbus.Error) {
-	err1 := walkQuestions(u.UserName, func(id int, salt string) error {
+// verifyAnswers 校验安全问题答案，返回未通过的问题 ID 列表。
+// 由 VerifySecretQuestions / VerifySecretQuestionsForReset 共用，
+// 仅在答案逐题比对阶段抽取，锁定检查与失败计数由调用方各自处理。
+func (u *User) verifyAnswers(answers map[int]string) (failed []int, err error) {
+	err = walkQuestions(u.UserName, func(id int, salt string) error {
 		answer, ok := answers[id]
 		if !ok || len(answer) == 0 {
 			return xerrors.New("empty answer")
@@ -1178,41 +1186,382 @@ func (u *User) VerifySecretQuestions(answers map[int]string) (failed []int, err 
 
 		return nil
 	})
+	if err != nil {
+		logger.Warningf("[verifyAnswers] walk questions failed for user=%s: %v", u.UserName, err)
+	}
+	return
+}
+
+func (u *User) VerifySecretQuestions(answers map[int]string) (failed []int, err *dbus.Error) {
+	// 检查安全问题验证是否被锁定
+	if !sqAllow(u.UserName) {
+		logger.Infof("[VerifySecretQuestions] user=%s security questions locked", u.UserName)
+		err = dbusutil.ToError(fmt.Errorf("security questions locked, please try again later"))
+		return
+	}
+
+	failed, err1 := u.verifyAnswers(answers)
 	if err1 != nil {
 		err = dbusutil.ToError(err1)
 		return
 	}
 
+	if len(failed) > 0 {
+		sqFail(u.UserName)
+		logger.Warningf("[VerifySecretQuestions] verification failed for user=%s, failed questions=%v", u.UserName, failed)
+	}
+
 	return
 }
 
-func (u *User) SetSecretQuestions(sender dbus.Sender, list map[int][]byte) *dbus.Error {
-	if len(list) != 3 {
-		return &dbus.ErrMsgInvalidArg
+const verifiedSessionTTL = 5 * time.Minute
+
+type verifiedSession struct {
+	username  string
+	expiresAt time.Time
+}
+
+var verifiedSessions sync.Map // map[dbusSenderName]*verifiedSession
+
+type sqAnswersPayload struct {
+	Answers map[int]string `json:"answers"`
+}
+
+func readMapFromFd(fd dbus.UnixFD) (map[int]string, error) {
+	f := os.NewFile(uintptr(fd), "")
+	defer f.Close()
+	data, readErr := io.ReadAll(f)
+	if readErr != nil {
+		return nil, readErr
+	}
+	var p sqAnswersPayload
+	if jsonErr := json.Unmarshal(data, &p); jsonErr != nil {
+		return nil, jsonErr
+	}
+	return p.Answers, nil
+}
+
+// VerifySecretQuestionsForReset 重设密码场景下的安全问题验证，
+// 验证通过后建立一次性会话供 ResetPassword 使用
+func (u *User) VerifySecretQuestionsForReset(sender dbus.Sender, answersFd dbus.UnixFD) (failed []int, err *dbus.Error) {
+	logger.Infof("[VerifySecretQuestionsForReset] user=%s", u.UserName)
+
+	// 检查安全问题验证是否被锁定
+	if !sqAllow(u.UserName) {
+		logger.Infof("[VerifySecretQuestionsForReset] user=%s security questions locked", u.UserName)
+		err = dbusutil.ToError(fmt.Errorf("security questions locked, please try again later"))
+		return
 	}
 
-	err := u.checkAuth(sender, false, polkitActionChangeOwnData)
-	if err != nil {
+	answers, readErr := readMapFromFd(answersFd)
+	if readErr != nil {
+		logger.Warningf("[VerifySecretQuestionsForReset] failed to read fd: %v", readErr)
+		err = dbusutil.ToError(fmt.Errorf("failed to read payload"))
+		return
+	}
+
+	failed, err2 := u.verifyAnswers(answers)
+	if err2 != nil {
+		err = dbusutil.ToError(err2)
+		return
+	}
+
+	if len(failed) == 0 {
+		verifiedSessions.Store(string(sender), &verifiedSession{
+			username:  u.UserName,
+			expiresAt: time.Now().Add(verifiedSessionTTL),
+		})
+		logger.Infof("[VerifySecretQuestionsForReset] user=%s verification passed", u.UserName)
+	} else {
+		// 验证失败，累加安全问题失败计数
+		sqFail(u.UserName)
+		logger.Infof("[VerifySecretQuestionsForReset] user=%s verification failed, failed questions=%v", u.UserName, failed)
+	}
+	return
+}
+
+type sqPasswordPayload struct {
+	NewPassword string `json:"newPassword"`
+}
+
+func readStringFromFd(fd dbus.UnixFD) (string, error) {
+	f := os.NewFile(uintptr(fd), "")
+	defer f.Close()
+	data, readErr := io.ReadAll(f)
+	if readErr != nil {
+		return "", readErr
+	}
+	var p sqPasswordPayload
+	if jsonErr := json.Unmarshal(data, &p); jsonErr != nil {
+		return "", jsonErr
+	}
+	return p.NewPassword, nil
+}
+
+func (u *User) ResetPassword(sender dbus.Sender, passwordFd dbus.UnixFD) *dbus.Error {
+	logger.Infof("[ResetPassword] user=%s", u.UserName)
+
+	newPassword, readErr := readStringFromFd(passwordFd)
+	if readErr != nil {
+		logger.Warningf("[ResetPassword] failed to read fd: %v", readErr)
+		return dbusutil.ToError(fmt.Errorf("failed to read payload"))
+	}
+
+	if len(newPassword) == 0 {
+		logger.Warning("[ResetPassword] empty password")
+		return dbusutil.ToError(fmt.Errorf("invalid password"))
+	}
+
+	val, ok := verifiedSessions.Load(string(sender))
+	if !ok {
+		logger.Warning("[ResetPassword] no verified session for caller")
+		return dbusutil.ToError(fmt.Errorf("verification required"))
+	}
+
+	session, ok := val.(*verifiedSession)
+	if !ok {
+		verifiedSessions.Delete(string(sender))
+		logger.Warning("[ResetPassword] invalid session type")
+		return dbusutil.ToError(fmt.Errorf("invalid session"))
+	}
+
+	verifiedSessions.Delete(string(sender))
+
+	if session.expiresAt.Before(time.Now()) {
+		logger.Warning("[ResetPassword] session expired")
+		return dbusutil.ToError(fmt.Errorf("session expired"))
+	}
+
+	if session.username != u.UserName {
+		logger.Warningf("[ResetPassword] session username mismatch: session=%s, user=%s", session.username, u.UserName)
+		return dbusutil.ToError(fmt.Errorf("session does not match user"))
+	}
+
+	var count = 10
+	for {
+		_, err := users.GetShadowInfo(u.UserName)
+		if err == nil {
+			break
+		}
+		count--
+		if count == 0 {
+			logger.Warningf("[ResetPassword] timeout waiting for shadow info for user: %s", u.UserName)
+			return dbusutil.ToError(err)
+		}
+		time.Sleep(time.Second)
+	}
+
+	if err := users.ModifyPasswd(newPassword, u.UserName); err != nil {
+		logger.Warningf("[ResetPassword] modify password failed for user %s: %v", u.UserName, err)
 		return dbusutil.ToError(err)
 	}
 
-	err = os.MkdirAll(secretQuestionDirectory, os.ModePerm)
+	logger.Infof("[ResetPassword] password changed successfully for user: %s", u.UserName)
+
+	// Reset authentication failure limits
+	auth := authenticate.NewAuthenticate(u.service.Conn())
+	err := auth.ResetLimits(0, u.UserName)
 	if err != nil {
-		return dbusutil.ToError(err)
+		logger.Warningf("[ResetPassword] reset limits failed: %v", err)
 	}
 
-	path := filepath.Join(secretQuestionDirectory, u.UserName)
+	// 重置安全问题限制
+	sqReset(u.UserName)
 
+	// Force remove login keyring since password changed without original password
+	err = removeLoginKeyring(u)
+	if err != nil {
+		logger.Warningf("[ResetPassword] remove login keyring failed: %v", err)
+	}
+
+	return nil
+}
+
+// InvalidateVerificationSession 供调用者主动取消验证会话（如退出重置密码对话框）
+func (u *User) InvalidateVerificationSession(sender dbus.Sender) *dbus.Error {
+	verifiedSessions.Delete(string(sender))
+	logger.Infof("[InvalidateVerificationSession] session invalidated for sender=%s", string(sender))
+	return nil
+}
+
+// startVerifiedSessionCleaner 定期清理过期的验证会话
+func startVerifiedSessionCleaner() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		verifiedSessions.Range(func(key, value interface{}) bool {
+			session, ok := value.(*verifiedSession)
+			if !ok {
+				verifiedSessions.Delete(key)
+				return true
+			}
+			if session.expiresAt.Before(now) {
+				verifiedSessions.Delete(key)
+				logger.Debugf("Cleaned expired session: %s", key)
+			}
+			return true
+		})
+	}
+}
+
+// GetSqLimits 查询安全问题验证的限制状态
+func (u *User) GetSqLimits() (locked bool, maxTries int, numFailures int, unlockTime string, busErr *dbus.Error) {
+	logger.Infof("[GetSqLimits] user=%s", u.UserName)
+
+	locked, maxTries, numFailures, ut := sqGetLimits(u.UserName)
+	utStr := ""
+	if !ut.IsZero() {
+		utStr = ut.Format(time.RFC3339)
+	}
+	logger.Infof("[GetSqLimits] locked=%v, maxTries=%d, numFailures=%d, unlockTime=%s",
+		locked, maxTries, numFailures, utStr)
+	return locked, maxTries, numFailures, utStr, nil
+}
+
+// SecretQuestionItem 表示一道安全问题及其加密后的答案，按前端选择顺序排列
+type SecretQuestionItem struct {
+	ID              int
+	EncryptedAnswer []byte
+}
+
+type sqSetPayload struct {
+	Committed bool                        `json:"committed"`
+	Questions []secretQuestionPayloadItem `json:"questions"`
+}
+
+type secretQuestionPayloadItem struct {
+	ID              int    `json:"id"`
+	EncryptedAnswer []byte `json:"encryptedAnswer"`
+}
+
+// sqPipeCancelMap 保存 SetSecretQuestions 的 context cancel 函数，
+// key 为 DBus sender，用于取消旧会话的 goroutine。
+var sqPipeCancelMap sync.Map
+
+const maxQuestionPayload = 10 * 1024
+
+func saveSecretQuestions(userName string, list []SecretQuestionItem) error {
+	if err := os.MkdirAll(secretQuestionDirectory, 0700); err != nil {
+		logger.Warningf("[saveSecretQuestions] mkdir secret question dir failed for user=%s: %v", userName, err)
+		return err
+	}
+	if err := os.Chmod(secretQuestionDirectory, 0700); err != nil {
+		logger.Warningf("failed to chmod secret question directory: %v", err)
+	}
+
+	path := filepath.Join(secretQuestionDirectory, userName)
 	var content bytes.Buffer
-	for id, encryptedAnswer := range list {
-		content.WriteString(strconv.Itoa(id))
+	for _, item := range list {
+		content.WriteString(strconv.Itoa(item.ID))
 		content.WriteRune(':')
-		content.Write(encryptedAnswer)
+		content.Write(item.EncryptedAnswer)
 		content.WriteRune('\n')
 	}
+	return os.WriteFile(path, content.Bytes(), 0600)
+}
 
-	err = os.WriteFile(path, content.Bytes(), 0600)
-	return dbusutil.ToError(err)
+// SetSecretQuestions 统一入口：鉴权 → 开启异步读取管道 → 返回。
+// 前端传入 pipe 读端 fd，daemon 鉴权后启动 goroutine 阻塞读取。
+// 提交：前端写入 committed JSON 并关闭写端 → goroutine 处理保存。
+// 取消：前端关闭写端 → goroutine 读到 EOF（空数据）→ 丢弃。
+func (u *User) SetSecretQuestions(sender dbus.Sender, questionsFd dbus.UnixFD) *dbus.Error {
+	logger.Infof("[SetSecretQuestions] user=%s", u.UserName)
+	sysBusName := string(sender)
+	key := sysBusName
+
+	// 取消旧会话，通知旧 goroutine 退出
+	if cancel, loaded := sqPipeCancelMap.LoadAndDelete(key); loaded {
+		cancel.(context.CancelFunc)()
+	}
+
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	sqPipeCancelMap.Store(key, ctxCancel)
+
+	// 将 fd 包装为 *os.File，由后续流程负责关闭
+	readerFile := os.NewFile(uintptr(questionsFd), "")
+
+	uid, err := u.service.GetConnUID(sysBusName)
+	if err != nil {
+		logger.Warningf("[SetSecretQuestions] get conn uid failed for user=%s sender=%s: %v", u.UserName, sysBusName, err)
+		readerFile.Close()
+		ctxCancel()
+		return dbusutil.ToError(err)
+	}
+
+	if u.isSelf(uid) {
+		// 本人：密码-only 鉴权
+		err = checkAuth(polkitActionChangeSecurityQuestions, sysBusName)
+	} else {
+		// 管理员：checkAuth 内部会将 action 升级为 user-administration
+		err = u.checkAuth(sender, false, polkitActionChangeOwnData)
+	}
+
+	if err != nil {
+		readerFile.Close()
+		ctxCancel()
+		logger.Warningf("[SetSecretQuestions] auth failed for user=%s: %v", u.UserName, err)
+		return dbusutil.ToError(err)
+	}
+
+	// 鉴权成功，启动 goroutine 异步读取
+	go func() {
+		defer ctxCancel()
+		defer sqPipeCancelMap.Delete(key)
+		defer readerFile.Close()
+
+		// 通过内部 goroutine 执行阻塞读取，使外部可被 context 取消
+		type readResult struct {
+			data []byte
+			err  error
+		}
+		ch := make(chan readResult, 1)
+		go func() {
+			data, readErr := io.ReadAll(io.LimitReader(readerFile, maxQuestionPayload))
+			ch <- readResult{data, readErr}
+		}()
+
+		select {
+		case <-ctx.Done():
+			logger.Infof("[SetSecretQuestions] cancelled for user=%s", u.UserName)
+			return
+		case result := <-ch:
+			if result.err != nil {
+				logger.Warningf("[SetSecretQuestions] read error: %v", result.err)
+				return
+			}
+			if len(result.data) == 0 {
+				logger.Infof("[SetSecretQuestions] empty data (cancelled) for user=%s", u.UserName)
+				return
+			}
+
+			var p sqSetPayload
+			if jsonErr := json.Unmarshal(result.data, &p); jsonErr != nil {
+				logger.Warningf("[SetSecretQuestions] invalid json: %v", jsonErr)
+				return
+			}
+			if !p.Committed {
+				logger.Infof("[SetSecretQuestions] not committed, discarded for user=%s", u.UserName)
+				return
+			}
+			if len(p.Questions) != 3 {
+				logger.Warningf("[SetSecretQuestions] expected 3 questions, got %d", len(p.Questions))
+				return
+			}
+
+			list := make([]SecretQuestionItem, len(p.Questions))
+			for i, q := range p.Questions {
+				list[i] = SecretQuestionItem{ID: q.ID, EncryptedAnswer: q.EncryptedAnswer}
+			}
+			if err := saveSecretQuestions(u.UserName, list); err != nil {
+				logger.Warningf("[SetSecretQuestions] save failed: %v", err)
+				return
+			}
+			logger.Infof("[SetSecretQuestions] saved for user=%s", u.UserName)
+		}
+	}()
+
+	return nil
 }
 
 func (u *User) SetSecretKey(sender dbus.Sender, secretKey string) *dbus.Error {
@@ -1244,6 +1593,25 @@ func (u *User) GetSecretKey(sender dbus.Sender, username string) (string, *dbus.
 		return string(key), dbusutil.ToError(err)
 	}
 	return string(key), nil
+}
+
+func (u *User) HasSecretKey() (bool, *dbus.Error) {
+	logger.Debugf("[HasSecretKey] UserName : %s", u.UserName)
+	if u.uadpInterface == nil {
+		logger.Warningf("[HasSecretKey] uadpInterface is nil for user=%s", u.UserName)
+		return false, nil
+	}
+	names, err := u.uadpInterface.ListName(0)
+	if err != nil {
+		logger.Warningf("[HasSecretKey] ListName failed: %v", err)
+		return false, dbusutil.ToError(err)
+	}
+	for _, name := range names {
+		if name == u.UserName {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (u *User) DeleteSecretKey(sender dbus.Sender) *dbus.Error {

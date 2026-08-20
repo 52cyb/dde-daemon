@@ -31,6 +31,28 @@
       "description": "Password encryption algorithm (sha512, sha256, yescrypt, sm3(default))",
       "permissions": "readwrite",
       "visibility": "private"
+    },
+    "sqMaxRetries": {
+      "value": 10,
+      "serial": 0,
+      "flags": ["global"],
+      "name": "sqMaxRetries",
+      "name[zh_CN]": "安全问题最大尝试次数",
+      "description": "Max retries for security question verification, range [1, 100]. Values out of range fall back to default (10).",
+      "description[zh_CN]": "安全问题验证的最大尝试次数，超过后将锁定。取值范围 1~100，超出范围将回退默认值。默认 10 次。",
+      "permissions": "readonly",
+      "visibility": "private"
+    },
+    "sqLockSecs": {
+      "value": 300,
+      "serial": 0,
+      "flags": ["global"],
+      "name": "sqLockSecs",
+      "name[zh_CN]": "安全问题锁定时间（秒）",
+      "description": "Lock duration after exceeding max retries, range [60, 604800] (1 minute to 7 days). Values out of range fall back to default (300).",
+      "description[zh_CN]": "安全问题验证超过最大尝试次数后的锁定时间，单位为秒。取值范围 60~604800（1分钟~7天），超出范围将回退默认值。默认 300 秒（5 分钟）。",
+      "permissions": "readonly",
+      "visibility": "private"
     }
   }
 }

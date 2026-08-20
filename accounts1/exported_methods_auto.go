@@ -140,6 +140,11 @@ func (v *User) GetExportedMethods() dbusutil.ExportedMethods {
 			OutArgs: []string{"list"},
 		},
 		{
+			Name:    "HasSecretKey",
+			Fn:      v.HasSecretKey,
+			OutArgs: []string{"outArg0"},
+		},
+		{
 			Name:    "IsPasswordExpired",
 			Fn:      v.IsPasswordExpired,
 			OutArgs: []string{"outArg0"},
@@ -242,7 +247,7 @@ func (v *User) GetExportedMethods() dbusutil.ExportedMethods {
 		{
 			Name:   "SetSecretQuestions",
 			Fn:     v.SetSecretQuestions,
-			InArgs: []string{"list"},
+			InArgs: []string{"questionsFd"},
 		},
 		{
 			Name:   "SetShell",
@@ -283,6 +288,26 @@ func (v *User) GetExportedMethods() dbusutil.ExportedMethods {
 			Fn:      v.VerifySecretQuestions,
 			InArgs:  []string{"answers"},
 			OutArgs: []string{"failed"},
+		},
+		{
+			Name:    "VerifySecretQuestionsForReset",
+			Fn:      v.VerifySecretQuestionsForReset,
+			InArgs:  []string{"answersFd"},
+			OutArgs: []string{"failed"},
+		},
+		{
+			Name: "InvalidateVerificationSession",
+			Fn:   v.InvalidateVerificationSession,
+		},
+		{
+			Name:   "ResetPassword",
+			Fn:     v.ResetPassword,
+			InArgs: []string{"passwordFd"},
+		},
+		{
+			Name:    "GetSqLimits",
+			Fn:      v.GetSqLimits,
+			OutArgs: []string{"locked", "maxTries", "numFailures", "unlockTime"},
 		},
 	}
 }

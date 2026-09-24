@@ -121,9 +121,7 @@ func (s *Sink) SetVolume(value float64, isPlay bool) *dbus.Error {
 	} else {
 		// SetMute中判断了音量是否为0，但是Volume是根据事件刷新的，此时还不是设置后的音量，因此会影响判断
 		if err := s.setMuteWithoutFeedback(false); err == nil {
-			if GetConfigKeeper().Mute.MuteOutput {
-				GetConfigKeeper().SetMuteOutput(false)
-			}
+			s.saveMuteConfig(false)
 		} else {
 			logger.Warning(err)
 		}
@@ -260,7 +258,7 @@ func (s *Sink) SetMute(value bool) *dbus.Error {
 		return dbusutil.ToError(err)
 
 	}
-	GetConfigKeeper().SetMuteOutput(value)
+	s.saveMuteConfig(value)
 	return nil
 }
 
@@ -287,6 +285,23 @@ func (s *Sink) setMuteInternal(value bool, isPlayFeedback bool) error {
 		s.playFeedback()
 	}
 	return nil
+}
+
+// saveMuteConfig 持久化当前输出设备的静音状态：
+// 全局模式写全局静音配置，按设备模式写当前活动端口配置。
+func (s *Sink) saveMuteConfig(value bool) {
+	if s.audio.globalMuteEnabled.Load() {
+		if GetConfigKeeper().Mute.MuteOutput != value {
+			GetConfigKeeper().SetMuteOutput(value)
+		}
+		return
+	}
+	card, err := s.audio.cards.get(s.Card)
+	if err != nil {
+		logger.Warning(err)
+	} else {
+		GetConfigKeeper().SetMute(card, s.ActivePort.Name, value)
+	}
 }
 
 // 设置此设备的当前使用端口
